@@ -17,44 +17,83 @@ class AutoRacePerception(Node):
         self.bridge = CvBridge()
         
         self.start_moving = False
-        self.last_sign_cmd = "center"
         self.potential_sign = None
         self.sign_consistency_count = 0
         
-        # Логика блокировки
+        # === ЛОГИКА ЭТАПОВ ===
+        # 0 = Ждем светофор
+        # 1 = Ищем Синий знак
+        # 2 = Ищем Красный знак
+        # 3 = Стройка (Лидар)
+        self.mission_stage = 0 
+        
         self.decision_locked = False
         self.lock_timer = 0
+        
+        # === НОВОЕ: ЗАДЕРЖКА ПЕРЕД СТРОЙКОЙ ===
+        self.construction_wait_active = False
+        self.construction_wait_start = 0.0
         
         # Финиш
         self.team_name = "пупуни" 
         self.finish_timer_active = False
         self.finish_start_time = 0.0
 
-        self.get_logger().info("👀 Perception: AGGRESSIVE TOP CROP (40%)")
+        self.get_logger().info("👀 Perception: Ready (DELAYED CONSTRUCTION)")
 
     def img_callback(self, msg):
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
         except: return
 
+        now = self.get_clock().now().nanoseconds / 1e9
+
+        # 1. ТАЙМЕР ФИНИША
         if self.finish_timer_active:
-            elapsed = (self.get_clock().now().nanoseconds / 1e9) - self.finish_start_time
-            if elapsed >= 40.0:
+            if (now - self.finish_start_time) >= 999.0: 
                 self.finish_sequence()
                 return
 
+        # 2. ТАЙМЕР ОТЛОЖЕННОГО СТАРТА СТРОЙКИ (НОВОЕ)
+        if self.construction_wait_active:
+            elapsed = now - self.construction_wait_start
+            # Ждем 6 секунд перед включением режима
+            if elapsed >= 8.0:
+                self.get_logger().info("🚧 TIMER DONE -> ACTIVATING CONSTRUCTION MODE")
+                self.pub_command.publish(String(data="construction"))
+                
+                self.construction_wait_active = False
+                self.mission_stage = 3 # Переходим в вечный режим стройки
+                
+                # Блокируем камеру ненадолго, чтобы не ловить глюки
+                self.decision_locked = True
+                self.lock_timer = 20 
+            else:
+                # Пока ждем - просто выходим, пусть едет по команде center
+                return
+
+        # 3. ЛОГИКА БЛОКИРОВКИ ПОСЛЕ ПОВОРОТА
         if self.decision_locked:
             self.lock_timer -= 1
             if self.lock_timer <= 0:
                 self.decision_locked = False
-            if not self.start_moving:
-                self.check_traffic_light(cv_image)
+                
+                if self.mission_stage == 1:
+                    # Закончили поворот -> едем ПРЯМО и ищем КРАСНЫЙ
+                    self.pub_command.publish(String(data="center"))
+                    self.mission_stage = 2 
+                    self.get_logger().info("✅ TURN DONE -> SEARCHING RED")
             return
 
-        if not self.start_moving:
+        # 4. ПОИСК ЗНАКОВ
+        if self.mission_stage == 0:
             self.check_traffic_light(cv_image)
-        else:
-            self.detect_sign(cv_image)
+            
+        elif self.mission_stage == 1:
+            self.detect_sign(cv_image, target_color='blue')
+            
+        elif self.mission_stage == 2:
+            self.detect_sign(cv_image, target_color='red')
 
     def check_traffic_light(self, img):
         h, w, _ = img.shape
@@ -66,83 +105,73 @@ class AutoRacePerception(Node):
             self.get_logger().info("🟢 GREEN LIGHT! GO!")
             self.start_moving = True
             self.pub_command.publish(String(data="go"))
+            self.mission_stage = 1
 
-    def detect_sign(self, img):
+    def detect_sign(self, img, target_color='blue'):
         h, w, _ = img.shape
         roi = img[0:int(h*0.8), :] 
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        
-        # Синий
-        mask_blue = cv2.inRange(hsv, np.array([80, 40, 30]), np.array([140, 255, 255]))
         kernel = np.ones((3,3), np.uint8)
-        mask_blue = cv2.erode(mask_blue, kernel, iterations=1)
-        mask_blue = cv2.dilate(mask_blue, kernel, iterations=1)
         
-        contours, _ = cv2.findContours(mask_blue, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        contours = []
         
+        if target_color == 'blue':
+            mask = cv2.inRange(hsv, np.array([80, 40, 30]), np.array([140, 255, 255]))
+            mask = cv2.erode(mask, kernel, iterations=1)
+            mask = cv2.dilate(mask, kernel, iterations=1)
+            contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            
+        elif target_color == 'red':
+            mask1 = cv2.inRange(hsv, np.array([0, 100, 50]), np.array([10, 255, 255]))
+            mask2 = cv2.inRange(hsv, np.array([170, 100, 50]), np.array([180, 255, 255]))
+            mask = mask1 | mask2
+            mask = cv2.erode(mask, kernel, iterations=1)
+            mask = cv2.dilate(mask, kernel, iterations=1)
+            contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
         debug_frame = roi.copy()
         
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area > 300:
+            
+            if target_color == 'blue' and area > 300:
                 x, y, w_rect, h_rect = cv2.boundingRect(cnt)
+                if x < 5 or (x + w_rect) > (w - 5): continue 
                 
-                # Проверка границ
-                if x < 5 or (x + w_rect) > (w - 5):
-                    continue 
-
                 ratio = float(w_rect) / h_rect
                 if 0.5 < ratio < 2.0: 
-                    # Рамка знака
                     cv2.rectangle(debug_frame, (x,y), (x+w_rect, y+h_rect), (0,255,0), 2)
-                    
                     sign_roi = roi[y:y+h_rect, x:x+w_rect]
                     direction = self.analyze_arrow_top_crop(sign_roi) 
-                    
                     if direction:
-                        # Рисуем результат
-                        cv2.putText(debug_frame, direction, (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,255), 2)
                         self.process_consistency(direction)
                         break 
-        
+
+            elif target_color == 'red' and area > 400:
+                x, y, w_rect, h_rect = cv2.boundingRect(cnt)
+                cv2.rectangle(debug_frame, (x,y), (x+w_rect, y+h_rect), (0,0,255), 2)
+                cv2.putText(debug_frame, "CONSTRUCTION", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+                self.process_consistency("construction")
+                break
+
         cv2.imshow("Perception Debug", debug_frame)
         cv2.waitKey(1)
 
     def analyze_arrow_top_crop(self, sign_img):
-        """
-        Берем только ВЕРХНИЕ 40% знака.
-        Это отрезает вертикальную палку стрелки.
-        Остается только горизонтальный "наконечник".
-        """
         h, w, _ = sign_img.shape
-        
-        # === КЛЮЧЕВОЙ МОМЕНТ: РЕЖЕМ ЖЕСТКО ===
         crop_h = int(h * 0.4) 
         crop = sign_img[0:crop_h, :]
-        
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        # Белый
         mask = cv2.inRange(hsv, np.array([0, 0, 60]), np.array([180, 50, 255]))
-        
-        # Для отладки показываем, что именно мы анализируем (обрезанную верхушку)
-        cv2.imshow("Arrow Top Crop", mask)
         
         M = cv2.moments(mask)
         if M['m00'] < 10: return None 
         
-        # Центр масс белого пятна
         cx = int(M['m10'] / M['m00'])
         center_x = w / 2
         
-        # Если центр масс слева -> Left
-        # Если центр масс справа -> Right
-        
-        # Добавляем небольшой порог (5px), чтобы не шумело по центру
-        if cx < (center_x - 5):
-            return 'left'
-        elif cx > (center_x + 5):
-            return 'right'
-            
+        if cx < (center_x - 5): return 'left'
+        elif cx > (center_x + 5): return 'right'
         return None
 
     def process_consistency(self, direction):
@@ -152,21 +181,25 @@ class AutoRacePerception(Node):
             self.potential_sign = direction
             self.sign_consistency_count = 1
             
-        # Ждем 2 кадра
         if self.sign_consistency_count >= 2:
-            self.get_logger().info(f"🔵 SIGN LOCKED: {direction.upper()}")
-            self.pub_command.publish(String(data=direction))
+            self.get_logger().info(f"🔵 SIGN DETECTED: {direction.upper()}")
             
-            # БЛОКИРУЕМ РЕШЕНИЕ
-            self.decision_locked = True
-            self.lock_timer = 300 
-            self.get_logger().info("🔒 DECISION LOCKED")
+            if direction == "construction":
+                # === ИЗМЕНЕНИЕ: НЕ ОТПРАВЛЯЕМ СРАЗУ ===
+                self.get_logger().info("⏳ RED SIGN SEEN -> WAITING 6 SECONDS...")
+                self.construction_wait_active = True
+                self.construction_wait_start = self.get_clock().now().nanoseconds / 1e9
+                
+                # Блокируем детекцию знаков, чтобы не спамило
+                self.decision_locked = True
+                self.lock_timer = 9999 # Блокируем навсегда, пока таймер не сработает
+                
+            else:
+                # ОБЫЧНЫЙ ПОВОРОТ
+                self.pub_command.publish(String(data=direction))
+                self.decision_locked = True
+                self.lock_timer = 450 
             
-            if not self.finish_timer_active:
-                self.finish_timer_active = True
-                self.finish_start_time = self.get_clock().now().nanoseconds / 1e9
-                self.get_logger().info("⏳ FINISH TIMER: START")
-
             self.sign_consistency_count = 0
 
     def finish_sequence(self):
