@@ -28,6 +28,7 @@ setup(
     entry_points={
         'console_scripts': [
                 'lane_follower = autorace_core_pypyni.lane_follower:main',
+                'perception = autorace_core_pypyni.perception_node:main',
         ],
     },
 )

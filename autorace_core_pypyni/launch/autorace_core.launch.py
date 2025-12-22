@@ -13,5 +13,13 @@ def generate_launch_description():
             parameters=[
                 # Здесь можно будет передавать параметры, если понадобится
             ]
-        )
+        ),
+        
+        # 2. Узел компьютерного зрения (Глаза)
+        Node(
+            package='autorace_core_pypyni',  # Тот же самый пакет
+            executable='perception',         # Имя entry_point из setup.py (см. ниже!)
+            name='perception_node',
+            output='screen'
+        ),
     ])
