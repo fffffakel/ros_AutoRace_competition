@@ -9,222 +9,551 @@ import cv2
 import numpy as np
 import math
 
+# Узел lane_follower.py
+# Назначение: управление движением робота по полосе (желтая/белая линии) и режим 'construction' (проезд коридора из конусов).
+#
+# Ключевая идея:
+#   1) Камера -> выделение цветовых масок линий (желтая слева, белая справа).
+#   2) По маскам ищем центры линий (moments) и вычисляем целевую точку target_center (куда должен 'смотреть' робот по X).
+#   3) Ошибка error = (центр кадра) - target_center.
+#   4) PID (по error) формирует угловую скорость w (angular.z), а линейная скорость уменьшается при большом |w|.
+#
+# Режимы движения задаются текстовыми командами в топике /course_code:
+#   left/right/center  - выбор целевой траектории относительно полосы;
+#   construction       - коридор из конусов: конусы внизу кадра 'расширяют' маски линий, чтобы ехать между ними;
+#   go/stop            - разрешить/запретить публикацию движения.
+#
+# Лидар (/scan) используется в режиме construction как страховка:
+#   - экстренная реакция, если впереди слишком близко стена/конусы;
+#   - защита от ложного 'финиша' при кратковременной потере маски конусов.
+
+
+# Класс ROS2-ноды. Содержит:
+#   - подписки на камеру, команды миссий и лидар;
+#   - публикацию /cmd_vel;
+#   - внутреннее состояние режима и параметры регулятора.
+# Важный принцип: нода сама НЕ выбирает миссии, она лишь исполняет команды от perception/mission_control через /course_code.
+
+
 class LaneFollower(Node):
     def __init__(self):
-        super().__init__('lane_follower')
-        
-        qos_camera = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=1)
-        qos_command = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=10)
-        qos_lidar = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=1)
+        super().__init__("lane_follower")
 
-        # Подписки
-        self.sub_camera = self.create_subscription(Image, '/color/image', self.camera_callback, qos_camera)
-        self.sub_command = self.create_subscription(String, '/course_code', self.command_callback, qos_command)
-        self.sub_scan = self.create_subscription(LaserScan, '/scan', self.scan_callback, qos_lidar)
-        
-        # Паблишеры
-        self.pub_cmd_vel = self.create_publisher(Twist, '/cmd_vel', 10)
-        
-        # === ДОБАВЛЕНО: ПАБЛИШЕРЫ ДЛЯ ФИНИША ===
-        self.pub_finish = self.create_publisher(String, '/robot_finish', 10)
-        self.pub_course_code = self.create_publisher(String, '/course_code', 10)
-        
+        # QoS-профили:
+        #   camera и lidar: BEST_EFFORT + depth=1, чтобы получать самый свежий кадр/скан и не накапливать задержку.
+        #   команды: RELIABLE + depth=10, чтобы текстовые команды 'left/right/...' не терялись.
+
+        qos_camera = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        qos_command = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
+        qos_lidar = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+
+        # Подписки:
+        #   /color/image  -> основной сенсор для полос/конусов.
+        #   /course_code  -> внешний 'режимный' сигнал (что делать прямо сейчас).
+        #   /scan         -> страховка по расстоянию спереди (только часть логики завязана на лидар).
+
+        self.sub_camera = self.create_subscription(
+            Image, "/color/image", self.camera_callback, qos_camera
+        )
+        self.sub_command = self.create_subscription(
+            String, "/course_code", self.command_callback, qos_command
+        )
+        self.sub_scan = self.create_subscription(
+            LaserScan, "/scan", self.scan_callback, qos_lidar
+        )
+
+        # Паблишеры:
+        #   /cmd_vel        -> управление базой (Twist).
+        #   /robot_finish   -> сообщение рефери о завершении миссии (имя команды).
+        #   /course_code    -> обратная команда (например 'stop'), чтобы остановить движение после финиша.
+
+        self.pub_cmd_vel = self.create_publisher(Twist, "/cmd_vel", 10)
+
+        self.pub_finish = self.create_publisher(String, "/robot_finish", 10)
+        self.pub_course_code = self.create_publisher(String, "/course_code", 10)
+
+        # Служебные объекты и состояние движения:
+        #   bridge     - преобразование ROS Image <-> OpenCV.
+        #   twist      - переиспользуемый объект команды скорости.
+        #   stop_robot - 'предохранитель': если True, публикуем нули и игнорируем управление PID.
+
         self.bridge = CvBridge()
         self.twist = Twist()
-        self.stop_robot = True 
+        self.stop_robot = True
+
+        # Состояние восприятия и режима:
+        #   scan_ranges     - последний массив дальностей лидара (inf заменяется на 10.0).
+        #   lane_width_px   - оценка ширины полосы в пикселях (cw - cy), используется как запасной вариант, если видна только одна линия.
+        #   mode            - текущий режим (left/right/center/construction).
+        #
+        # Финиш в construction:
+        #   - no_cone_timer     считает кадры 'нет конусов' (после того, как конусы были замечены).
+        #   - seen_cones        защита от ложного финиша сразу при входе в режим.
+        #   - cones_seen_streak требует несколько последовательных кадров с конусами, чтобы признать 'конусы были'.
+        #   - NO_CONE_THRESHOLD и CONE_SEEN_THRESHOLD задают устойчивость к шуму.
+        #   - is_finished       одноразовый триггер финиша.
 
         self.scan_ranges = []
         self.lane_width_px = 300
-        self.mode = 'center'
-        
-        # Таймер и флаг финиша
-        self.no_cone_timer = 0
-        self.is_finished = False
-        self.team_name = "пупуни" # <--- ТВОЯ КОМАНДА
+        self.mode = "center"
 
-        # PID
-        self.Kp = 0.005 
+        self.no_cone_timer = 0
+
+        self.seen_cones = False
+        self.cones_seen_streak = 0
+        self.NO_CONE_THRESHOLD = 170
+        self.CONE_SEEN_THRESHOLD = 8
+        self.is_finished = False
+        self.team_name = "пупуни"
+
+        # Параметры PID:
+        #   error (в пикселях) -> w (угловая скорость).
+        #   Kp - реакция на текущую ошибку (основной вклад).
+        #   Ki - интеграл (здесь практически выключен, чтобы не 'накапливать' в поворотах).
+        #   Kd - демпфирование (реакция на изменение ошибки).
+        #
+        # Скорость:
+        #   desiredV - базовая линейная скорость режима.
+        #   Далее она уменьшается при больших поворотах (|w|), чтобы робот не вылетал с траектории.
+
+        self.Kp = 0.005
         self.Ki = 0.0000
         self.Kd = 0.005
-        
-        self.desiredV = 0.15 
+
+        self.desiredV = 0.15
         self.E = [0] * 15
         self.old_e = 0
 
         self.get_logger().info("Lane Follower: FULL SYSTEM READY")
 
+    # scan_callback(msg: LaserScan)
+    # Принимает массив дальностей и нормализует его:
+    #   - бесконечность (inf) заменяется на 'далеко' (10.0), чтобы min() работал без исключений.
+    # Важно: дальности не фильтруются по качеству; далее код сам ограничивает используемый сектор.
+
     def scan_callback(self, msg):
         self.scan_ranges = [r if not math.isinf(r) else 10.0 for r in msg.ranges]
 
+    # command_callback(msg: String)
+    # Принимает внешнюю команду режима из /course_code.
+    # Логика:
+    #   - left/right/center/construction: переключить mode, снять stop_robot, сбросить таймеры.
+    #   - stop: включить stop_robot (немедленная остановка через pid_control).
+    #   - go: разрешить движение (stop_robot=False).
+
     def command_callback(self, msg):
         cmd = msg.data.lower().strip()
-        if cmd in ['left', 'right', 'center', 'construction']:
+        if cmd in ["left", "right", "center", "construction"]:
             self.mode = cmd
             self.stop_robot = False
             self.no_cone_timer = 0
+            if cmd == "construction":
+                self.seen_cones = False
+                self.cones_seen_streak = 0
+            else:
+                self.cones_seen_streak = 0
+            if cmd == "construction":
+
+                self.seen_cones = False
             self.get_logger().info(f"👉 MODE: {cmd.upper()}")
-        elif cmd == 'stop':
+        elif cmd == "stop":
             self.stop_robot = True
             self.get_logger().info("🛑 ROBOT STOPPED (Command)")
-        elif cmd == 'go':
+        elif cmd == "go":
             self.stop_robot = False
+
+    # camera_callback(msg: Image)
+    # Главный цикл управления (на каждом кадре камеры):
+    #   1) Конвертация ROS->OpenCV.
+    #   2) Выбор ROI (нижняя часть кадра), где находятся линии/конусы.
+    #   3) HSV -> цветовые маски линий и конусов.
+    #   4) Если construction: конусы используются как 'виртуальные границы' (расширяем маски), плюс контролируем финиш.
+    #   5) Находим центры линий (moments), вычисляем target_center.
+    #   6) error -> PID -> публикация /cmd_vel.
 
     def camera_callback(self, msg):
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-        except: return
+        except:
+            return
+
+        # ROI (область интереса): берём нижние ~30% изображения.
+        # Причина: разметка/конусы находятся на дороге внизу; верх кадра чаще содержит фон/шум и ухудшает устойчивость.
 
         height, width, _ = cv_image.shape
-        crop_img = cv_image[int(height*0.7):height, 0:width]
+        crop_img = cv_image[int(height * 0.7) : height, 0:width]
         hsv = cv2.cvtColor(crop_img, cv2.COLOR_BGR2HSV)
-        
-        # 1. Маски ЛИНИЙ
-        lower_yellow = np.array([20, 80, 80]); upper_yellow = np.array([40, 255, 255])
-        lower_white = np.array([0, 0, 180]); upper_white = np.array([180, 50, 255])
+
+        # Маски линий в HSV:
+        #   yellow - левая линия;
+        #   white  - правая линия.
+        # Диапазоны подобраны под типичные условия симулятора/камеры и могут требовать калибровки под другой свет.
+
+        lower_yellow = np.array([20, 80, 80])
+        upper_yellow = np.array([40, 255, 255])
+        lower_white = np.array([0, 0, 180])
+        upper_white = np.array([180, 50, 255])
         mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
         mask_white = cv2.inRange(hsv, lower_white, upper_white)
 
-        # Чистим маски
+        # Разделение поля зрения пополам:
+        #   - жёлтую линию ищем только слева,
+        #   - белую линию ищем только справа.
+        # Это простая эвристика, которая резко снижает число ложных срабатываний (например, белые элементы слева).
+
         h_crop, w_crop = mask_yellow.shape
         mid = int(w_crop / 2)
-        mask_yellow[:, mid:] = 0 
-        mask_white[:, :mid] = 0 
+        mask_yellow[:, mid:] = 0
+        mask_white[:, :mid] = 0
 
-        # 2. Маски КОНУСОВ
+        # Маска конусов (красный цвет) в HSV:
+        # Красный в HSV 'разрывается' через 0/180, поэтому берём два диапазона (0..10) и (170..180) и объединяем.
+
         mask_cone1 = cv2.inRange(hsv, np.array([0, 100, 50]), np.array([10, 255, 255]))
-        mask_cone2 = cv2.inRange(hsv, np.array([170, 100, 50]), np.array([180, 255, 255]))
+        mask_cone2 = cv2.inRange(
+            hsv, np.array([170, 100, 50]), np.array([180, 255, 255])
+        )
         mask_cones = mask_cone1 | mask_cone2
-        
-        # 3. ВНЕДРЕНИЕ КОНУСОВ И ЛОГИКА ФИНИША
-        if self.mode == 'construction':
+
+        # Ветвление по режиму.
+        # construction отличается тем, что:
+        #   - скорость ниже (desiredV=0.1);
+        #   - конусы учитываются как препятствия/границы коридора;
+        #   - включена логика финиша и лидарная страховка.
+
+        if self.mode == "construction":
             self.desiredV = 0.1
-            
-            # === ПРОВЕРКА НА ФИНИШ ===
-            cone_pixels = cv2.countNonZero(mask_cones)
-            if cone_pixels < 200: 
-                self.no_cone_timer += 1
+
+            # Финиш в construction определяется исчезновением конусов из кадра.
+            # Чтобы не реагировать на красные объекты выше дороги (например, знак),
+            # считаем пиксели конусов только в нижней части маски (низ кадра).
+
+            h_mask, w_mask = mask_cones.shape
+            low_y0 = int(h_mask * 0.6)
+            mask_cones_low = mask_cones[low_y0:, :]
+
+            cone_pixels = cv2.countNonZero(mask_cones_low)
+
+            # Страховка по лидару: min_front = минимальная дистанция в узком секторе спереди.
+            # Использование:
+            #   - в логике финиша: 'нет конусов' засчитываем только если впереди уже свободно (min_front > 0.80),
+            #     чтобы робот не остановился прямо перед стеной из конусов из-за кратковременной потери маски.
+            # Сектор спереди выбран как 350..360 и 0..10 градусов (окно вокруг нулевого направления лидара).
+
+            min_front = 5.00
+            # Экстренная реакция в construction:
+            # Если впереди слишком близко препятствие (min_f < 0.35),
+            # то принудительно смещаем target_center в сторону (вправо/влево),
+            # пытаясь избежать столкновения.
+
+            if len(self.scan_ranges) > 0:
+                n = len(self.scan_ranges)
+                sec_front = (
+                    self.scan_ranges[int(n * (350 / 360)) :]
+                    + self.scan_ranges[0 : int(n * (10 / 360))]
+                )
+                f_vals = [r for r in sec_front if r < 9.0]
+                min_front = min(f_vals) if len(f_vals) > 0 else 10.0
+
+            # cone_pixels - число 'красных' пикселей (конуcов) в нижнем ROI.
+            # Порог 150 отделяет 'конуcы действительно видны' от шума/артефактов.
+            # cones_seen_streak требует несколько кадров подряд, чтобы установить seen_cones=True.
+
+            if cone_pixels >= 150:
+                self.cones_seen_streak += 1
+            else:
+                self.cones_seen_streak = 0
+
+            if self.cones_seen_streak >= self.CONE_SEEN_THRESHOLD:
+                self.seen_cones = True
+
+            # no_cone_timer - счётчик кадров, когда конусы 'пропали'.
+            # Логика:
+            #   - активируем только после seen_cones=True (то есть конусы реально встречались);
+            #   - увеличиваем только если cone_pixels < 150 И впереди свободно по лидару (min_front > 0.80);
+            #   - иначе сбрасываем в 0.
+            # Это даёт устойчивость к:
+            #   - временному перекрытию конусов линией/бликом,
+            #   - кратковременным провалам цветовой маски,
+            #   - остановке перед финальной стеной.
+
+            if self.seen_cones:
+                if cone_pixels < 150 and min_front > 0.80:
+                    self.no_cone_timer += 1
+                else:
+                    self.no_cone_timer = 0
             else:
                 self.no_cone_timer = 0
-            
-            # Если 60 кадров нет конусов и мы еще не финишировали
-            if self.no_cone_timer > 140 and not self.is_finished:
+
+            # Триггер финиша:
+            #   - конусы уже встречались (seen_cones=True);
+            #   - достаточно долго нет конусов (no_cone_timer > NO_CONE_THRESHOLD);
+            #   - финиш ещё не срабатывал (not is_finished).
+            # Действие:
+            #   - публикуем имя команды в /robot_finish;
+            #   - публикуем 'stop' в /course_code;
+            #   - устанавливаем stop_robot=True и отправляем нулевой Twist.
+
+            if (
+                self.seen_cones
+                and self.no_cone_timer > self.NO_CONE_THRESHOLD
+                and not self.is_finished
+            ):
                 self.is_finished = True
-                
-                # 1. Отправляем имя команды
+
                 self.pub_finish.publish(String(data=self.team_name))
-                # 2. Отправляем команду СТОП (себе и другим)
                 self.pub_course_code.publish(String(data="stop"))
-                # 3. Физически останавливаемся
                 self.stop_robot = True
                 self.pub_cmd_vel.publish(Twist())
-                
+
                 self.get_logger().info(f"🏁 MISSION COMPLETE! Team: {self.team_name}")
                 return
 
-            # Рисование стен
-            contours, _ = cv2.findContours(mask_cones, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-            contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[1], reverse=True)
-            
+            # Интеграция конусов в 'границы дороги':
+            #   - находим контуры конусов в нижнем ROI;
+            #   - берём несколько самых нижних (ближайших) контуров;
+            #   - для каждого конуса рисуем прямоугольник-подкладку в соответствующую маску линии:
+            #       слева -> mask_yellow, справа -> mask_white.
+            # Эффект: PID видит 'линию' даже там, где вместо разметки фактически конусы.
+
+            contours, _ = cv2.findContours(
+                mask_cones_low, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+            )
+            contours = sorted(
+                contours, key=lambda c: cv2.boundingRect(c)[1], reverse=True
+            )
+
             for i, cnt in enumerate(contours):
                 area = cv2.contourArea(cnt)
-                if area > 200: 
+                if area > 200:
                     x, y, w_rect, h_rect = cv2.boundingRect(cnt)
+                    y = y + low_y0
                     cx_cone = x + w_rect // 2
-                    pad = 25 
+                    pad = 25
                     if cx_cone < width / 2:
-                        cv2.rectangle(mask_yellow, (x-pad, y-pad), (x+w_rect+pad, y+h_rect+pad), 255, -1)
-                        cv2.rectangle(crop_img, (x, y), (x+w_rect, y+h_rect), (0, 255, 255), 2)
+                        cv2.rectangle(
+                            mask_yellow,
+                            (x - pad, y - pad),
+                            (x + w_rect + pad, y + h_rect + pad),
+                            255,
+                            -1,
+                        )
+                        cv2.rectangle(
+                            crop_img, (x, y), (x + w_rect, y + h_rect), (0, 255, 255), 2
+                        )
                     else:
-                        cv2.rectangle(mask_white, (x-pad, y-pad), (x+w_rect+pad, y+h_rect+pad), 255, -1)
-                        cv2.rectangle(crop_img, (x, y), (x+w_rect, y+h_rect), (255, 255, 255), 2)
-                    if i >= 2: break
+                        cv2.rectangle(
+                            mask_white,
+                            (x - pad, y - pad),
+                            (x + w_rect + pad, y + h_rect + pad),
+                            255,
+                            -1,
+                        )
+                        cv2.rectangle(
+                            crop_img,
+                            (x, y),
+                            (x + w_rect, y + h_rect),
+                            (255, 255, 255),
+                            2,
+                        )
+                    if i >= 2:
+                        break
         else:
             self.desiredV = 0.15
-            self.no_cone_timer = 0 
+            self.no_cone_timer = 0
 
-        # 4. Поиск центров
+        # Поиск положения линий:
+        # Используем моменты бинарных масок.
+        # cy/cw - координата X центра массы (m10/m00) для жёлтой/белой линии.
+        # Если m00==0, линия не обнаружена (None).
+
         M_y = cv2.moments(mask_yellow)
-        cy = int(M_y['m10']/M_y['m00']) if M_y['m00'] > 0 else None
+        cy = int(M_y["m10"] / M_y["m00"]) if M_y["m00"] > 0 else None
         M_w = cv2.moments(mask_white)
-        cw = int(M_w['m10']/M_w['m00']) if M_w['m00'] > 0 else None
+        cw = int(M_w["m10"] / M_w["m00"]) if M_w["m00"] > 0 else None
 
-        if cy and cw: self.lane_width_px = cw - cy
+        # Оценка ширины полосы в пикселях.
+        # Если видны обе линии, обновляем lane_width_px = cw - cy.
+        # Далее эта величина используется как 'геометрическая догадка', когда видна только одна линия.
 
-        target_center = width / 2 
+        if cy and cw:
+            self.lane_width_px = cw - cy
+
+        # target_center - желаемая координата X, в которую должен быть направлен робот.
+        # По сути это 'точка следования' на линии горизонта ROI.
+        # safety_offset - небольшой сдвиг, который держит робота дальше от границы при поворотах left/right.
+
+        target_center = width / 2
         safety_offset = 40
-        
-        # === ЛОГИКА ===
-        if self.mode == 'right':
-            if cw: target_center = cw - (self.lane_width_px / 2) + safety_offset
-            elif cy: target_center = cy + (self.lane_width_px / 2) + safety_offset
-            else: target_center = width 
-        
-        elif self.mode == 'left':
-            if cy: target_center = cy + (self.lane_width_px / 2) - safety_offset
-            elif cw: target_center = cw - (self.lane_width_px / 2) - safety_offset
-            else: target_center = 0 
 
-        elif self.mode == 'construction':
-            if cy and cw: target_center = (cy + cw) / 2
-            elif cy: target_center = cy + (self.lane_width_px / 2)
-            elif cw: target_center = cw - (self.lane_width_px / 2)
-            
-            # ЭКСТРЕННЫЙ ЛИДАР
+        # Выбор траектории по режиму:
+        #   right: смещаемся правее центра полосы;
+        #   left:  смещаемся левее центра полосы;
+        #   center: держим середину;
+        #   construction: держим середину коридора, приоритет - проезд между конусами.
+        #
+        # Если видна только одна линия, target_center восстанавливается через lane_width_px как половина ширины полосы.
+
+        if self.mode == "right":
+            if cw:
+                target_center = cw - (self.lane_width_px / 2) + safety_offset
+            elif cy:
+                target_center = cy + (self.lane_width_px / 2) + safety_offset
+            else:
+                target_center = width
+
+        elif self.mode == "left":
+            # Отладочная визуализация:
+            #   - точки cy/cw показывают найденные центры линий;
+            #   - точка target_center показывает цель.
+            # Окно используется только для дебага; на алгоритм управления не влияет.
+
+            if cy:
+                target_center = cy + (self.lane_width_px / 2) - safety_offset
+            elif cw:
+                target_center = cw - (self.lane_width_px / 2) - safety_offset
+            else:
+                target_center = 0
+
+        elif self.mode == "construction":
+            if cy and cw:
+                target_center = (cy + cw) / 2
+            elif cy:
+                target_center = cy + (self.lane_width_px / 2)
+            elif cw:
+                target_center = cw - (self.lane_width_px / 2)
+
             if len(self.scan_ranges) > 0:
                 n = len(self.scan_ranges)
-                sec_front = self.scan_ranges[int(n*(350/360)):] + self.scan_ranges[0:int(n*(10/360))]
+                sec_front = (
+                    self.scan_ranges[int(n * (350 / 360)) :]
+                    + self.scan_ranges[0 : int(n * (10 / 360))]
+                )
                 f_vals = [r for r in sec_front if r < 9.0]
                 min_f = min(f_vals) if len(f_vals) > 0 else 10.0
-                
-                if min_f < 0.35: 
-                    self.get_logger().info(f"🧱 WALL ({min_f:.2f})")
-                    if cy and not cw: target_center = width
-                    elif cw and not cy: target_center = 0
-                    else: target_center = width
 
-        else: # CENTER
-            if cy and cw: target_center = (cy + cw) / 2
-            elif cy: target_center = cy + (self.lane_width_px / 2)
-            elif cw: target_center = cw - (self.lane_width_px / 2)
+                if min_f < 0.35:
+                    self.get_logger().info(f"🧱 WALL ({min_f:.2f})")
+                    if cy and not cw:
+                        target_center = width
+                    elif cw and not cy:
+                        target_center = 0
+                    else:
+                        target_center = width
+
+        else:
+            if cy and cw:
+                target_center = (cy + cw) / 2
+            elif cy:
+                target_center = cy + (self.lane_width_px / 2)
+            elif cw:
+                target_center = cw - (self.lane_width_px / 2)
+
+        # Ошибка управления:
+        #   error > 0  -> target_center правее центра кадра, нужно повернуть вправо/сместиться.
+        #   error < 0  -> target_center левее центра, нужно повернуть влево.
+        # Знак далее интерпретируется PID-регулятором при вычислении angular.z.
 
         error = (width / 2) - target_center
 
-        # Debug HUD
-        if cy: cv2.circle(crop_img, (cy, 20), 8, (0, 255, 255), -1)
-        if cw: cv2.circle(crop_img, (cw, 20), 8, (255, 255, 255), -1)
+        if cy:
+            cv2.circle(crop_img, (cy, 20), 8, (0, 255, 255), -1)
+        if cw:
+            cv2.circle(crop_img, (cw, 20), 8, (255, 255, 255), -1)
         cv2.circle(crop_img, (int(target_center), 40), 6, (0, 255, 0), -1)
-        
-        if self.mode == 'construction':
+
+        if self.mode == "construction":
             color = (0, 255, 0) if self.no_cone_timer < 180 else (0, 0, 255)
-            cv2.putText(crop_img, f"Finish Timer: {self.no_cone_timer}/180", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            cv2.putText(
+                crop_img,
+                f"Finish Timer: {self.no_cone_timer}/{self.NO_CONE_THRESHOLD}",
+                (10, 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                color,
+                2,
+            )
+
+        # Показ кадра и короткий waitKey(1) нужны для обновления окна OpenCV.
+        # В headless-среде (без дисплея) эти вызовы обычно отключают.
 
         cv2.imshow("Lane Tracking", crop_img)
         cv2.waitKey(1)
-        
+
         self.pid_control(error)
 
+    # pid_control(error)
+    # Преобразует пиксельную ошибку в команду скорости:
+    #   1) Если stop_robot=True -> публикуем нули и выходим.
+    #   2) P: текущая ошибка.
+    #   3) I: сумма последних ошибок (скользящее окно self.E).
+    #   4) D: разница error - old_e.
+    #   5) Ограничиваем w в диапазоне [-2.0, 2.0] (защита от резких рывков).
+    #   6) Линейную скорость уменьшаем при повороте, оставляя нижний предел 0.05.
+
     def pid_control(self, error):
+        # Безопасная остановка:
+        # В этом режиме нода всегда публикует Twist(0,0) независимо от входного error.
+        # Используется по команде 'stop' или после финиша.
+
         if self.stop_robot:
-            self.twist.linear.x = 0.0; self.twist.angular.z = 0.0
-            self.pub_cmd_vel.publish(self.twist); return
-        
+            self.twist.linear.x = 0.0
+            self.twist.angular.z = 0.0
+            self.pub_cmd_vel.publish(self.twist)
+            return
+
         e_P = error
-        self.E.pop(0); self.E.append(error)
+        self.E.pop(0)
+        self.E.append(error)
+        # Основная формула PID:
+        #   w = Kp*P + Ki*I + Kd*D
+        # где w — угловая скорость (angular.z).
+
         w = self.Kp * e_P + self.Ki * sum(self.E) + self.Kd * (error - self.old_e)
         w = max(min(w, 2.0), -2.0)
-        
+
+        # Адаптация линейной скорости:
+        # Чем сильнее поворот (больше |w|), тем ниже linear_v.
+        # Это простая стабилизация, чтобы на крутых манёврах не сносило за границы.
+
         linear_v = self.desiredV * (1 - 0.5 * abs(w) / 2.0)
-        if linear_v < 0.05: linear_v = 0.05
+        if linear_v < 0.05:
+            linear_v = 0.05
 
         self.twist.linear.x = linear_v
-        self.twist.angular.z = float(w) 
+        self.twist.angular.z = float(w)
         self.pub_cmd_vel.publish(self.twist)
         self.old_e = error
+
+
+# Точка входа ROS2.
+# Создаём ноду, запускаем spin() и корректно освобождаем ресурсы (node + OpenCV окна) при завершении.
+
 
 def main(args=None):
     rclpy.init(args=args)
     node = LaneFollower()
-    try: rclpy.spin(node)
-    except KeyboardInterrupt: pass
-    finally: node.destroy_node(); rclpy.shutdown(); cv2.destroyAllWindows()
-if __name__ == '__main__': main()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
