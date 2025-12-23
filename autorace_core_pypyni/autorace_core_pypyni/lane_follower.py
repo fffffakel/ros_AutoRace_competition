@@ -113,7 +113,7 @@ class LaneFollower(Node):
 
         self.seen_cones = False
         self.cones_seen_streak = 0
-        self.NO_CONE_THRESHOLD = 170
+        self.NO_CONE_THRESHOLD = 160
         self.CONE_SEEN_THRESHOLD = 8
         self.is_finished = False
         self.team_name = "пупуни"
@@ -486,11 +486,11 @@ class LaneFollower(Node):
                 2,
             )
 
+        # ДЕБАГ
         # Показ кадра и короткий waitKey(1) нужны для обновления окна OpenCV.
-        # В headless-среде (без дисплея) эти вызовы обычно отключают.
 
-        cv2.imshow("Lane Tracking", crop_img)
-        cv2.waitKey(1)
+        # cv2.imshow("Lane Tracking", crop_img)
+        # cv2.waitKey(1)
 
         self.pid_control(error)
 

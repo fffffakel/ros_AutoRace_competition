@@ -265,9 +265,11 @@ class AutoRacePerception(Node):
                 )
                 self.process_consistency("construction")
                 break
+        
+        # ДЕБАГ
 
-        cv2.imshow("Perception Debug", debug_frame)
-        cv2.waitKey(1)
+        # cv2.imshow("Perception Debug", debug_frame)
+        # cv2.waitKey(1)
 
     # analyze_arrow_top_crop(sign_img)
     # Грубая оценка направления стрелки:
